@@ -6,5 +6,4 @@ Simple FastAPI implementation for the assessment:
 - Idempotent by `transaction_id` (DB primary key).
 - `GET /v1/transactions/{transaction_id}` — read status.
 - `GET /` — health check with current UTC time.
-
-## Quick start (local, recommended)
+- `GET /docs` -  Interactive API documentation.

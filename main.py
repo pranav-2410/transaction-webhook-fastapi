@@ -1,7 +1,6 @@
-# main.py
-import time
+import asyncio
 import datetime
-from fastapi import FastAPI, BackgroundTasks, HTTPException, status
+from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 from database import SessionLocal
 from models import transactions, create_tables
@@ -11,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 app = FastAPI(title="Transaction Webhook Assessment")
 create_tables()
 
+
 class WebhookPayload(BaseModel):
     transaction_id: str = Field(..., example="txn_abc123def456")
     source_account: str
@@ -18,29 +18,48 @@ class WebhookPayload(BaseModel):
     amount: float
     currency: str
 
+
 @app.get("/")
 def health():
     return {"status": "HEALTHY", "current_time": datetime.datetime.utcnow().isoformat() + "Z"}
 
-def process_transaction_background(transaction_id: str):
+
+async def process_transaction_background(transaction_id: str):
+    """Asynchronous background processor for webhook transactions."""
+    print(f"[{datetime.datetime.utcnow()}] Started background task for {transaction_id}")
     db = SessionLocal()
     try:
-        row = db.execute(select(transactions).where(transactions.c.transaction_id == transaction_id)).first()
-        if not row:
+        result = db.execute(
+            select(transactions).where(transactions.c.transaction_id == transaction_id)
+        ).first()
+        if not result:
+            print(f"[{datetime.datetime.utcnow()}] Transaction not found: {transaction_id}")
             return
-        current_status = row[0].status
+
+        row = result._mapping  # ✅ Access columns by name
+        current_status = row["status"]
+
         if current_status == "PROCESSED":
+            print(f"[{datetime.datetime.utcnow()}] Transaction already processed: {transaction_id}")
             return
-        # simulate 30s external processing
-        time.sleep(30)
+
+        # Simulate ~30s external processing
+        print(f"[{datetime.datetime.utcnow()}] Processing {transaction_id}...")
+        await asyncio.sleep(30)
+        print(f"[{datetime.datetime.utcnow()}] Finished waiting for {transaction_id}")
+
+        # Update DB
         db.execute(
             update(transactions)
             .where(transactions.c.transaction_id == transaction_id)
             .values(status="PROCESSED", processed_at=datetime.datetime.utcnow())
         )
         db.commit()
+        print(f"[{datetime.datetime.utcnow()}] Marked {transaction_id} as PROCESSED")
+
     except Exception as e:
-        # store error details and increment attempts
+        print(f"[{datetime.datetime.utcnow()}] Error processing {transaction_id}: {e}")
+        db.rollback()
         db.execute(
             update(transactions)
             .where(transactions.c.transaction_id == transaction_id)
@@ -50,8 +69,11 @@ def process_transaction_background(transaction_id: str):
     finally:
         db.close()
 
+
+
 @app.post("/v1/webhooks/transactions", status_code=status.HTTP_202_ACCEPTED)
-def receive_webhook(payload: WebhookPayload, background_tasks: BackgroundTasks):
+async def receive_webhook(payload: WebhookPayload):
+    """Receives a transaction webhook and schedules async processing."""
     db = SessionLocal()
     try:
         stmt = insert(transactions).values(
@@ -61,34 +83,44 @@ def receive_webhook(payload: WebhookPayload, background_tasks: BackgroundTasks):
             amount=payload.amount,
             currency=payload.currency,
             status="PROCESSING",
-            created_at=datetime.datetime.utcnow()
+            created_at=datetime.datetime.utcnow(),
         )
         db.execute(stmt)
         db.commit()
-        background_tasks.add_task(process_transaction_background, payload.transaction_id)
+        print(f"[{datetime.datetime.utcnow()}] Received new transaction {payload.transaction_id}")
     except IntegrityError:
         db.rollback()
-        result = db.execute(select(transactions).where(transactions.c.transaction_id == payload.transaction_id)).first()
+        result = db.execute(
+            select(transactions).where(transactions.c.transaction_id == payload.transaction_id)
+        ).first()
         if result:
-            row = result._mapping  # this gives you a dictionary-like row
-            if row["status"] != "PROCESSED":
-                background_tasks.add_task(process_transaction_background, payload.transaction_id)
-
+            row = result._mapping
+            if row["status"] == "PROCESSED":
+                print(f"[{datetime.datetime.utcnow()}] Duplicate ignored (already processed): {payload.transaction_id}")
+                db.close()
+                return {}
+            print(f"[{datetime.datetime.utcnow()}] Duplicate detected, reprocessing: {payload.transaction_id}")
     finally:
         db.close()
+
+    # ✅ Schedule the async background task safely
+    asyncio.create_task(process_transaction_background(payload.transaction_id))
     return {}
+
 
 @app.get("/v1/transactions/{transaction_id}")
 def get_transaction(transaction_id: str):
+    """Fetch transaction details by ID."""
     db = SessionLocal()
-    result = db.execute(select(transactions).where(transactions.c.transaction_id == transaction_id)).first()
+    result = db.execute(
+        select(transactions).where(transactions.c.transaction_id == transaction_id)
+    ).first()
     db.close()
 
     if not result:
         raise HTTPException(status_code=404, detail="transaction not found")
 
-    row = result._mapping  # access columns safely
-
+    row = result._mapping
     return {
         "transaction_id": row["transaction_id"],
         "source_account": row["source_account"],
